@@ -1,0 +1,9 @@
+---
+id: moode-player
+name: Moode Now Playing
+summary: Moode Now Playing
+desc: Fetches now-playing info from Moode's REST API and displays artist, title and album.
+author: tronbyt
+fileName: moode_now.star
+packageName: moodeplayer
+recommendedInterval: 10
