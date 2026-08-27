@@ -11,6 +11,7 @@ API_URL = "https://wildc.net/dp/api.py"
 
 # Cache TTL in seconds
 CACHE_TTL = 15
+MAX_GENERATION_ID = 4665  # api stopped saving files after this number
 
 # Display constants (matching generate_pixlet.py)
 # Pendulum length constraints (matching API defaults)
@@ -37,18 +38,21 @@ def get_layout(width, height):
         height = height,
     )
 
-def fetch_simulation(seed, layout):
+def fetch_simulation(seed, layout, generation_id = None):
     """Fetch a simulation from the API and transform coordinates to pixel space."""
-    cache_key = "sim_" + str(seed) + "_" + str(layout.width)
+    cache_key = ("gen_" + str(generation_id) if generation_id else "sim_" + str(seed)) + "_" + str(layout.width)
 
     # Try to get from cache first
     cached = cache.get(cache_key)
     if cached != None:
         return json.decode(cached)
 
-    # Build API URL with parameters
-    # Request a simulation with specific seed for reproducibility
-    url = API_URL + "?mode=random&duration=20&step_size=0.033&seed=" + str(seed)
+    # Build URL - either from specific generation or random API
+    if generation_id:
+        url = "https://wildc.net/dp/generations/" + str(generation_id) + ".json"
+    else:
+        # Request a simulation with specific seed for reproducibility
+        url = API_URL + "?mode=random&duration=20&step_size=0.033&seed=" + str(seed)
 
     # Fetch from API
     response = http.get(url, ttl_seconds = CACHE_TTL)
@@ -110,8 +114,22 @@ def main(config):
     animation = config.get("animation", "random")
     speed = config.get("speed", "fast")
 
+    # Handle "random from all sources" by randomly picking a source
+    if animation == "random_all":
+        # Randomly pick between: embedded (0), api random params (1), api random generation (2)
+        source = time.now().unix % 3
+        if source == 0:
+            # Use random embedded simulation (excluding the API sentinel)
+            animation = "random"
+        elif source == 1:
+            # Use API with random params
+            animation = "api"
+        else:
+            # Use random generation from API
+            animation = "api_random"
+
     # Determine which simulation to use
-    if animation == "api":
+    if animation == "api" or animation == "api_random":
         sim_idx = len(ALL_SIMULATIONS) - 1  # Use last index for API mode
     elif animation == "random" or animation == "":
         sim_idx = time.now().unix % len(ALL_SIMULATIONS)
@@ -126,10 +144,23 @@ def main(config):
 
     # Check if the selected simulation is the API sentinel (last simulation)
     if sim_idx == len(ALL_SIMULATIONS) - 1:
-        # Fetch from API
-        seed = time.now().unix  # Changes every second
-        print("Fetching simulation from API with seed: " + str(seed))
-        sim_data = fetch_simulation(seed, layout)
+        # Check if we should use a random generation from the collection
+        if animation == "api_random":
+            # Check if a specific generation ID was provided
+            generation_id = config.get("generation_id", "")
+            if generation_id and generation_id != "":
+                print("Fetching specific generation: " + generation_id)
+                sim_data = fetch_simulation(0, layout, generation_id)
+            else:
+                # Randomly pick a generation from 1 to 1630
+                generation_id = str((time.now().unix % MAX_GENERATION_ID) + 1)
+                print("Fetching random generation: " + generation_id)
+                sim_data = fetch_simulation(0, layout, generation_id)
+        else:
+            # Fetch from API with random seed (ignore generation_id field)
+            seed = time.now().unix  # Changes every second
+            print("Fetching simulation from API with seed: " + str(seed))
+            sim_data = fetch_simulation(seed, layout)
 
         # Handle fetch failure
         if sim_data == None:
@@ -165,6 +196,8 @@ def main(config):
     # Set delay based on speed (slow = 33ms, fast = 16ms)
     if speed == "fast":
         delay = 16  # Fast: twice as fast (~60fps)
+    elif speed == "extra_fast":
+        delay = 11  # ~90fps
     else:
         delay = 33  # Slow: normal speed (~30fps)
 
@@ -178,6 +211,14 @@ def main(config):
             all_frames.append(render_frame_simple(simulation, frame_idx, hsv_to_rgb, api_origin_y, api_name, config, layout))
         else:
             all_frames.append(render_frame(config, sim_idx, frame_idx, hsv_to_rgb, layout))
+
+    # Add freeze frames if enabled (before fade-out)
+    freeze_frames = generate_freeze_frames(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name)
+    all_frames.extend(freeze_frames)
+
+    # Add fade-out frames if enabled
+    fade_out_frames = generate_fade_out_frames(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name)
+    all_frames.extend(fade_out_frames)
 
     return render.Root(
         delay = delay,
@@ -230,8 +271,8 @@ def make_hsv_to_rgb():
 
     return hsv_to_rgb
 
-def draw_line(x0, y0, x1, y1, width, height):
-    """Draw a line using Bresenham's line algorithm"""
+def draw_line_bresenham(x0, y0, x1, y1, width, height):
+    """Draw a line using Bresenham's line algorithm, returns list of (x, y) points."""
     points = []
     dx = abs(x1 - x0)
     dy = abs(y1 - y0)
@@ -256,6 +297,67 @@ def draw_line(x0, y0, x1, y1, width, height):
             y0 = y0 + sy
 
     return points
+
+def draw_line_widget(x1, y1, x2, y2, color):
+    """Draws a line using absolute coordinates by wrapping render.Line in Padding."""
+
+    # Determine bounding box
+    min_x = min(x1, x2)
+    min_y = min(y1, y2)
+
+    # Normalize coordinates to be relative to the bounding box
+    lx1 = x1 - min_x
+    ly1 = y1 - min_y
+    lx2 = x2 - min_x
+    ly2 = y2 - min_y
+
+    return render.Padding(
+        pad = (min_x, min_y, 0, 0),
+        child = render.Line(
+            x1 = lx1,
+            y1 = ly1,
+            x2 = lx2,
+            y2 = ly2,
+            width = 1,
+            color = color,
+        ),
+    )
+
+def render_lines(line_style, origin_x, origin_y, x1, y1, x2, y2, color, layout):
+    """Render the pendulum arm lines based on the selected style."""
+    if line_style == "none":
+        # No lines
+        return []
+    elif line_style == "bresenham":
+        # Classic Bresenham algorithm - render as 1x1 boxes
+        line1_points = draw_line_bresenham(origin_x, origin_y, x1, y1, layout.width, layout.height)
+        line2_points = draw_line_bresenham(x1, y1, x2, y2, layout.width, layout.height)
+        return [
+            render.Stack(
+                children = [
+                    render.Padding(
+                        pad = (pt[0], pt[1], 0, 0),
+                        child = render.Box(width = 1, height = 1, color = color),
+                    )
+                    for pt in line1_points
+                ],
+            ),
+            render.Stack(
+                children = [
+                    render.Padding(
+                        pad = (pt[0], pt[1], 0, 0),
+                        child = render.Box(width = 1, height = 1, color = color),
+                    )
+                    for pt in line2_points
+                ],
+            ),
+        ]
+    else:
+        # Default: widget (render.Line)
+        return [
+            draw_line_widget(origin_x, origin_y, x1, y1, color),
+            draw_line_widget(x1, y1, x2, y2, color),
+        ]
 
 def to_hex(value):
     """Convert integer to 2-digit lowercase hex string"""
@@ -334,27 +436,33 @@ def render_frame_simple(simulation, frame_idx, hsv_to_rgb, origin_y, sim_name, c
         trail_points.append((f[2], f[3], trail_color))  # x2, y2, color
 
     label = sim_name if config.bool("show_label", False) else ""
+    line_style = config.get("line_style", "widget")
+    line_color = config.get("line_color", "#FFFFFF")
+    show_joints = config.bool("show_joints", True)
 
-    return render.Stack(
-        children = [
-            # Black background
-            render.Box(
-                width = layout.width,
-                height = layout.height,
-                color = "#000",
+    # Build the children list dynamically based on line style
+    children = [
+        # Black background
+        render.Box(
+            width = layout.width,
+            height = layout.height,
+            color = "#000",
+        ),
+
+        # Display simulation hash name in top left corner
+        render.Padding(
+            pad = (1, 1, 0, 0),
+            child = render.Text(
+                content = label,
+                color = "#888",
+                font = "tom-thumb",
             ),
+        ),
+    ]
 
-            # Display simulation hash name in top left corner
-            render.Padding(
-                pad = (1, 1, 0, 0),
-                child = render.Text(
-                    content = label,
-                    color = "#888",
-                    font = "tom-thumb",
-                ),
-            ),
-
-            # Fixed origin point (white dot)
+    # Fixed origin point (white dot) - only if show_joints is enabled
+    if show_joints:
+        children.append(
             render.Padding(
                 pad = (origin_x - 1, origin_y - 1, 0, 0),
                 child = render.Circle(
@@ -362,41 +470,27 @@ def render_frame_simple(simulation, frame_idx, hsv_to_rgb, origin_y, sim_name, c
                     diameter = 2,
                 ),
             ),
+        )
 
-            # Trail dots for second bob (with color gradient)
-            render.Stack(
-                children = [
-                    render.Padding(
-                        pad = (pt[0], pt[1], 0, 0),
-                        child = render.Box(width = 1, height = 1, color = pt[2]),
-                    ) if (pt[0] >= 0 and pt[0] < layout.width and pt[1] >= 0 and pt[1] < layout.height) else render.Box(width = 0, height = 0)
-                    for pt in trail_points
-                ],
-            ),
+    # Trail dots for second bob (with color gradient)
+    children.append(
+        render.Stack(
+            children = [
+                render.Padding(
+                    pad = (pt[0], pt[1], 0, 0),
+                    child = render.Box(width = 1, height = 1, color = pt[2]),
+                ) if (pt[0] >= 0 and pt[0] < layout.width and pt[1] >= 0 and pt[1] < layout.height) else render.Box(width = 0, height = 0)
+                for pt in trail_points
+            ],
+        ),
+    )
 
-            # Lines connecting origin -> bob1 -> bob2
-            # Line from origin to first bob
-            render.Stack(
-                children = [
-                    render.Padding(
-                        pad = (pt[0], pt[1], 0, 0),
-                        child = render.Box(width = 1, height = 1, color = "#FFFFFF"),
-                    )
-                    for pt in draw_line(origin_x, origin_y, x1, y1, layout.width, layout.height)
-                ],
-            ),
-            # Line from first bob to second bob
-            render.Stack(
-                children = [
-                    render.Padding(
-                        pad = (pt[0], pt[1], 0, 0),
-                        child = render.Box(width = 1, height = 1, color = "#FFFFFF"),
-                    )
-                    for pt in draw_line(x1, y1, x2, y2, layout.width, layout.height)
-                ],
-            ),
+    # Add lines based on selected style
+    children.extend(render_lines(line_style, origin_x, origin_y, x1, y1, x2, y2, line_color, layout))
 
-            # First bob (cyan)
+    # Add first bob (cyan) - only if show_joints is enabled
+    if show_joints:
+        children.append(
             render.Padding(
                 pad = (x1 - 1, y1 - 1, 0, 0),
                 child = render.Circle(
@@ -404,17 +498,20 @@ def render_frame_simple(simulation, frame_idx, hsv_to_rgb, origin_y, sim_name, c
                     diameter = 2,
                 ),
             ) if (x1 >= 0 and x1 < layout.width and y1 >= 0 and y1 < layout.height) else render.Box(width = 0, height = 0),
+        )
 
-            # Second bob (color changes over time)
-            render.Padding(
-                pad = (x2 - 1, y2 - 1, 0, 0),
-                child = render.Circle(
-                    color = bob2_color,
-                    diameter = 3,
-                ),
-            ) if (x2 >= 0 and x2 < layout.width and y2 >= 0 and y2 < layout.height) else render.Box(width = 0, height = 0),
-        ],
+    # Add second bob (color changes over time)
+    children.append(
+        render.Padding(
+            pad = (x2 - 1, y2 - 1, 0, 0),
+            child = render.Circle(
+                color = bob2_color,
+                diameter = 3,
+            ),
+        ) if (x2 >= 0 and x2 < layout.width and y2 >= 0 and y2 < layout.height) else render.Box(width = 0, height = 0),
     )
+
+    return render.Stack(children = children)
 
 def render_frame(config, sim_idx, frame_idx, hsv_to_rgb, layout):
     """Render frame for embedded simulation (with simulation number displayed)."""
@@ -472,27 +569,33 @@ def render_frame(config, sim_idx, frame_idx, hsv_to_rgb, layout):
         trail_points.append((int(f[2] * scale_factor), int(f[3] * scale_factor), trail_color))  # x2, y2, color
 
     label = "no." + str(sim_idx + 1) if config.bool("show_label", False) else ""
+    line_style = config.get("line_style", "widget")
+    line_color = config.get("line_color", "#FFFFFF")
+    show_joints = config.bool("show_joints", True)
 
-    return render.Stack(
-        children = [
-            # Black background
-            render.Box(
-                width = layout.width,
-                height = layout.height,
-                color = "#000",
+    # Build the children list dynamically based on line style
+    children = [
+        # Black background
+        render.Box(
+            width = layout.width,
+            height = layout.height,
+            color = "#000",
+        ),
+
+        # Display simulation number in top left corner
+        render.Padding(
+            pad = (1, 1, 0, 0),
+            child = render.Text(
+                content = label,
+                color = "#888",
+                font = "tom-thumb",
             ),
+        ),
+    ]
 
-            # Display simulation number in top left corner
-            render.Padding(
-                pad = (1, 1, 0, 0),
-                child = render.Text(
-                    content = label,
-                    color = "#888",
-                    font = "tom-thumb",
-                ),
-            ),
-
-            # Fixed origin point (white dot)
+    # Fixed origin point (white dot) - only if show_joints is enabled
+    if show_joints:
+        children.append(
             render.Padding(
                 pad = (origin_x - 1, origin_y - 1, 0, 0),
                 child = render.Circle(
@@ -500,8 +603,143 @@ def render_frame(config, sim_idx, frame_idx, hsv_to_rgb, layout):
                     diameter = 2,
                 ),
             ),
+        )
 
-            # Trail dots for second bob (with color gradient)
+    # Trail dots for second bob (with color gradient)
+    children.append(
+        render.Stack(
+            children = [
+                render.Padding(
+                    pad = (pt[0], pt[1], 0, 0),
+                    child = render.Box(width = 1, height = 1, color = pt[2]),
+                ) if (pt[0] >= 0 and pt[0] < layout.width and pt[1] >= 0 and pt[1] < layout.height) else render.Box(width = 0, height = 0)
+                for pt in trail_points
+            ],
+        ),
+    )
+
+    # Add lines based on selected style
+    children.extend(render_lines(line_style, origin_x, origin_y, x1, y1, x2, y2, line_color, layout))
+
+    # Add first bob (cyan) - only if show_joints is enabled
+    if show_joints:
+        children.append(
+            render.Padding(
+                pad = (x1 - 1, y1 - 1, 0, 0),
+                child = render.Circle(
+                    color = "#00FFFF",
+                    diameter = 2,
+                ),
+            ) if (x1 >= 0 and x1 < layout.width and y1 >= 0 and y1 < layout.height) else render.Box(width = 0, height = 0),
+        )
+
+    # Add second bob (color changes over time)
+    children.append(
+        render.Padding(
+            pad = (x2 - 1, y2 - 1, 0, 0),
+            child = render.Circle(
+                color = bob2_color,
+                diameter = 3,
+            ),
+        ) if (x2 >= 0 and x2 < layout.width and y2 >= 0 and y2 < layout.height) else render.Box(width = 0, height = 0),
+    )
+
+    return render.Stack(children = children)
+
+def generate_fade_out_frames(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name):
+    """Generate fade-out frames that freeze the last frame and fade to black over 2-3 seconds."""
+    fade_out_enabled = config.bool("enable_fade_out", False)
+    if not fade_out_enabled:
+        return []
+
+    # Calculate number of fade frames (2-3 seconds at current delay)
+    delay = 16 if config.get("speed", "slow") == "fast" else 33
+    fade_duration_ms = 2500  # 2.5 seconds
+    num_fade_frames = int(fade_duration_ms / delay)
+
+    # Get the simulation name for label (positions not needed for fade-out)
+    if is_api_mode:
+        sim_name = api_name
+    else:
+        sim_name = "no." + str(sim_idx + 1)
+
+    fade_frames = []
+    for i in range(num_fade_frames):
+        # Calculate opacity (1.0 to 0.0)
+        opacity = 1.0 - (float(i) / float(num_fade_frames))
+
+        # Create fade frame (only need sim_name for label, not positions)
+        fade_frame = render_fade_frame(sim_name, config, layout, opacity, is_api_mode, simulation, hsv_to_rgb)
+        fade_frames.append(fade_frame)
+
+    return fade_frames
+
+def generate_freeze_frames(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name):
+    """Generate freeze frames that show only the trace from the last frame for a configurable duration."""
+    freeze_duration = int(config.get("freeze_duration", "0"))
+    if freeze_duration == 0:
+        return []
+
+    # Calculate number of freeze frames based on delay
+    delay = 16 if config.get("speed", "slow") == "fast" else 33
+    freeze_duration_ms = freeze_duration * 1000  # Convert to milliseconds
+    num_freeze_frames = int(freeze_duration_ms / delay)
+
+    # Create identical freeze frames (all showing only the trace from the last animation frame)
+    freeze_frames = []
+    for _ in range(num_freeze_frames):
+        freeze_frame = render_freeze_frame(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name)
+        freeze_frames.append(freeze_frame)
+
+    return freeze_frames
+
+def render_freeze_frame(simulation, is_api_mode, config, layout, hsv_to_rgb, sim_idx, api_name):
+    """Render a freeze frame showing only the trace from the complete animation (no legs/joints)."""
+
+    # Get configuration values
+    label = api_name if is_api_mode else "no." + str(sim_idx + 1)
+    show_label = config.bool("show_label", False)
+
+    # Build the children list - only background and full trace
+    children = [
+        # Black background
+        render.Box(
+            width = layout.width,
+            height = layout.height,
+            color = "#000",
+        ),
+
+        # Display label if enabled
+        render.Padding(
+            pad = (1, 1, 0, 0),
+            child = render.Text(
+                content = label if show_label else "",
+                color = "#888",
+                font = "tom-thumb",
+            ),
+        ),
+    ]
+
+    # Add the full trace (all points from the entire simulation)
+    if len(simulation) > 0:
+        trail_points = []
+
+        # Show all trail points from the complete animation
+        for i in range(len(simulation)):
+            if is_api_mode:
+                f = simulation[i]
+                tx, ty = f[2], f[3]
+            else:
+                scale_factor = layout.width / 64.0
+                f = simulation[i]
+                tx = int(f[2] * scale_factor)
+                ty = int(f[3] * scale_factor)
+
+            trail_hue = (i * 360.0 / len(simulation)) % 360
+            trail_color = hsv_to_rgb(trail_hue, 1.0, 0.5)
+            trail_points.append((tx, ty, trail_color))
+
+        children.append(
             render.Stack(
                 children = [
                     render.Padding(
@@ -511,54 +749,98 @@ def render_frame(config, sim_idx, frame_idx, hsv_to_rgb, layout):
                     for pt in trail_points
                 ],
             ),
+        )
 
-            # Lines connecting origin -> bob1 -> bob2
-            # Line from origin to first bob
+    return render.Stack(children = children)
+
+def render_fade_frame(sim_name, config, layout, opacity, is_api_mode, simulation, hsv_to_rgb):
+    """Render a single fade-out frame with only the trace fading, legs and joints hidden."""
+
+    # Get configuration values
+    label = sim_name if config.bool("show_label", False) else ""
+
+    # Apply opacity to colors (only for trace)
+    def apply_opacity(color, opacity):
+        if not color or not color.startswith("#"):
+            return color
+
+        color = color[1:]
+        if len(color) < 6:
+            return color
+
+        r = int(color[0:2], 16)
+        g = int(color[2:4], 16)
+        b = int(color[4:6], 16)
+
+        # Apply opacity by blending with black
+        r = int(r * opacity)
+        g = int(g * opacity)
+        b = int(b * opacity)
+
+        return "#" + to_hex(r) + to_hex(g) + to_hex(b)
+
+    # Build the children list - only background and fading trace
+    children = [
+        # Black background
+        render.Box(
+            width = layout.width,
+            height = layout.height,
+            color = "#000",
+        ),
+
+        # Display label if enabled (fades with trace)
+        render.Padding(
+            pad = (1, 1, 0, 0),
+            child = render.Text(
+                content = label,
+                color = apply_opacity("#888", opacity),
+                font = "tom-thumb",
+            ),
+        ),
+    ]
+
+    # Add only the fading trails (no legs, no joints)
+    # Always show the full trace during fade-out if we have simulation data
+    if len(simulation) > 0:
+        trail_points = []
+
+        # Show ALL trail points during fade-out for complete pattern
+        for i in range(len(simulation)):
+            if is_api_mode:
+                f = simulation[i]
+                tx, ty = f[2], f[3]
+            else:
+                scale_factor = layout.width / 64.0
+                f = simulation[i]
+                tx = int(f[2] * scale_factor)
+                ty = int(f[3] * scale_factor)
+
+            trail_hue = (i * 360.0 / len(simulation)) % 360
+            trail_color = hsv_to_rgb(trail_hue, 1.0, 0.5)
+            faded_trail_color = apply_opacity(trail_color, opacity)
+            trail_points.append((tx, ty, faded_trail_color))
+
+        children.append(
             render.Stack(
                 children = [
                     render.Padding(
                         pad = (pt[0], pt[1], 0, 0),
-                        child = render.Box(width = 1, height = 1, color = "#FFFFFF"),
-                    )
-                    for pt in draw_line(origin_x, origin_y, x1, y1, layout.width, layout.height)
+                        child = render.Box(width = 1, height = 1, color = pt[2]),
+                    ) if (pt[0] >= 0 and pt[0] < layout.width and pt[1] >= 0 and pt[1] < layout.height) else render.Box(width = 0, height = 0)
+                    for pt in trail_points
                 ],
             ),
-            # Line from first bob to second bob
-            render.Stack(
-                children = [
-                    render.Padding(
-                        pad = (pt[0], pt[1], 0, 0),
-                        child = render.Box(width = 1, height = 1, color = "#FFFFFF"),
-                    )
-                    for pt in draw_line(x1, y1, x2, y2, layout.width, layout.height)
-                ],
-            ),
+        )
 
-            # First bob (cyan)
-            render.Padding(
-                pad = (x1 - 1, y1 - 1, 0, 0),
-                child = render.Circle(
-                    color = "#00FFFF",
-                    diameter = 2,
-                ),
-            ) if (x1 >= 0 and x1 < layout.width and y1 >= 0 and y1 < layout.height) else render.Box(width = 0, height = 0),
-
-            # Second bob (color changes over time)
-            render.Padding(
-                pad = (x2 - 1, y2 - 1, 0, 0),
-                child = render.Circle(
-                    color = bob2_color,
-                    diameter = 3,
-                ),
-            ) if (x2 >= 0 and x2 < layout.width and y2 >= 0 and y2 < layout.height) else render.Box(width = 0, height = 0),
-        ],
-    )
+    return render.Stack(children = children)
 
 def get_schema():
     # Build animation options dynamically
     animation_options = [
-        schema.Option(display = "Random", value = "random"),
-        schema.Option(display = "Random params from API", value = "api"),
+        schema.Option(display = "Random from all sources", value = "random_all"),
+        schema.Option(display = "Random from built in list", value = "random"),
+        schema.Option(display = "Random params from API (new generation)", value = "api"),
+        schema.Option(display = "Random generation from API (previously generated)", value = "api_random"),
     ]
     for i in range(1, len(ALL_SIMULATIONS) + 1):
         animation_options.append(
@@ -580,6 +862,10 @@ def get_schema():
                         value = "fast",
                     ),
                     schema.Option(
+                        display = "Extra Fast (3x speed)",
+                        value = "extra_fast",
+                    ),
+                    schema.Option(
                         display = "Slow (normal)",
                         value = "slow",
                     ),
@@ -590,8 +876,15 @@ def get_schema():
                 name = "Animation",
                 desc = "Select which animation to display",
                 icon = "film",
-                default = "random",
+                default = "random_all",
                 options = animation_options,
+            ),
+            schema.Text(
+                id = "generation_id",
+                name = "Generation ID",
+                desc = "Enter a specific generation ID between 1 and 4665 (only used with 'Random generation from API' mode)",
+                icon = "hashtag",
+                default = "",
             ),
             schema.Toggle(
                 id = "show_full_animation",
@@ -625,6 +918,54 @@ def get_schema():
                     schema.Option(display = "Fast", value = "3"),
                     schema.Option(display = "Medium", value = "2"),
                     schema.Option(display = "Slow", value = "1"),
+                ],
+            ),
+            schema.Dropdown(
+                id = "line_style",
+                name = "Line Style",
+                desc = "How to draw the pendulum leg lines",
+                icon = "penNib",
+                default = "widget",
+                options = [
+                    schema.Option(display = "Pixlet render.Line", value = "widget"),
+                    schema.Option(display = "Classic (Bresenham)", value = "bresenham"),
+                    schema.Option(display = "No lines", value = "none"),
+                ],
+            ),
+            schema.Color(
+                id = "line_color",
+                name = "Leg Color",
+                desc = "Color of the pendulum leg lines",
+                icon = "palette",
+                default = "#FFFFFF",
+            ),
+            schema.Toggle(
+                id = "show_joints",
+                name = "Show Joints",
+                desc = "Show the origin point and leg joint (first bob)",
+                icon = "circleDot",
+                default = True,
+            ),
+            schema.Toggle(
+                id = "enable_fade_out",
+                name = "Enable Fade Out",
+                desc = "Freeze and fade away the animation at the end",
+                icon = "wandSparkles",
+                default = False,
+            ),
+            schema.Dropdown(
+                id = "freeze_duration",
+                name = "Freeze Duration",
+                desc = "How long to freeze on the last frame (0 = disabled)",
+                icon = "clock",
+                default = "0",
+                options = [
+                    schema.Option(display = "Disabled (0s)", value = "0"),
+                    schema.Option(display = "1 second", value = "1"),
+                    schema.Option(display = "2 seconds", value = "2"),
+                    schema.Option(display = "3 seconds", value = "3"),
+                    schema.Option(display = "4 seconds", value = "4"),
+                    schema.Option(display = "5 seconds", value = "5"),
                 ],
             ),
         ],
